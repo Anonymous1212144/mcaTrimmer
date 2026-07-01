@@ -1,6 +1,8 @@
 # mcaTrimmer
 Trims mca files to remove unwanted chunks
 
+![Example Result](example.png)
+
 This multithreaded program will work on every file in its folder that is named like region files, trimming ones where there are chunks you want to keep and **deleting** ones with no chunks you want. So **keep a backup before running**. Where "trim" means it removes data for chunks that you do not want to keep and compact the rest, so the file will become smaller.
 
 # Instructions
