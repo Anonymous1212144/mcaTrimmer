@@ -112,10 +112,11 @@ uint_fast64_t *bsearch_c(const uint_fast64_t target, const size_t **const top)
 int thread_func(void *arg)
 {
     (void)arg;
+    const size_t capacity = queue.capacity;
     while (1)
     {
         // The reader role. Looks through dictionary to find file names and populate queue
-        if ((queue.count < queue.capacity) && !queue.done && (mtx_trylock(&(queue.r_lock)) == thrd_success))
+        if ((queue.count < capacity) && !queue.done && (mtx_trylock(&(queue.r_lock)) == thrd_success))
         {
             uint_fast8_t working;
             do
@@ -128,9 +129,9 @@ int thread_func(void *arg)
                     break;
                 }
                 mtx_lock(&(queue.q_lock));
-                size_t index = (queue.index + queue.count) % queue.capacity;
+                size_t index = (queue.index + queue.count) % capacity;
                 memcpy(queue.head + (index * name_len), fileData.cFileName, name_len);
-                working = (++queue.count < queue.capacity);
+                working = (++queue.count < capacity);
                 cnd_signal(&(queue.notify));
                 mtx_unlock(&(queue.q_lock));
             } while (working);
@@ -156,7 +157,7 @@ int thread_func(void *arg)
         if (!name)
             handle_error("Error while opening region files");
         memcpy(name, queue.head + (queue.index * name_len), name_len);
-        queue.index = (queue.index + 1) % queue.capacity;
+        queue.index = (queue.index + 1) % capacity;
         queue.count--;
         mtx_unlock(&(queue.q_lock));
 
@@ -343,7 +344,7 @@ void init_queue(size_t capacity)
 int main(int argc, char *argv[])
 {
     size_t num_threads = 2;
-    char *file_name = "chunks.txt";
+    const char *file_name = "chunks.txt";
 
     if (argc > 1)
         num_threads = strtoull(argv[1], NULL, 0);
