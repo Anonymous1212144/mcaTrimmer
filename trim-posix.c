@@ -35,7 +35,6 @@ typedef struct
     uint_fast8_t done;
 } Queue;
 
-const size_t name_len = sizeof(((struct dirent *)0)->d_name);
 const size_t c_size = sizeof(uint_fast64_t);
 
 uint_fast64_t *chunks = NULL;
@@ -132,7 +131,7 @@ int thread_func(void *arg)
                 }
                 mtx_lock(&(queue.q_lock));
                 size_t index = (queue.index + queue.count) % capacity;
-                memcpy(queue.head + (index * name_len), f->d_name, name_len);
+                strncpy(queue.head + (index << 6), f->d_name, 64);
                 working = (++queue.count < capacity);
                 cnd_signal(&(queue.notify));
                 mtx_unlock(&(queue.q_lock));
@@ -155,12 +154,13 @@ int thread_func(void *arg)
             cnd_wait(&(queue.notify), &(queue.q_lock));
         }
 
-        char name[name_len];
-        memcpy(name, queue.head + (queue.index * name_len), name_len);
+        char name[65];
+        strncpy(name, queue.head + (queue.index << 6), 64);
         queue.index = (queue.index + 1) % capacity;
         queue.count--;
         mtx_unlock(&(queue.q_lock));
 
+        name[64] = 0;
         char *ni = name;
         if (*ni++ != 'r' || *ni++ != '.')
             continue;
@@ -180,7 +180,7 @@ int thread_func(void *arg)
 
         uint_fast64_t rx = n - '0';
 
-        const char *ne = name + name_len;
+        const char *ne = name + 64;
         while (ni < ne)
         {
             n = *ni++;
@@ -315,7 +315,7 @@ void init_queue(size_t capacity)
     cnd_init(&(queue.notify));
     mtx_init(&(queue.q_lock), mtx_plain);
     mtx_init(&(queue.r_lock), mtx_plain);
-    queue.head = (char *)malloc(capacity * name_len);
+    queue.head = (char *)malloc(capacity << 6);
     queue.capacity = capacity;
     queue.index = 0;
     queue.count = 0;
@@ -402,15 +402,17 @@ int main(int argc, char *argv[])
 
     if (--num_threads)
     {
-        thrd_t t[num_threads];
+        thrd_t *t = (thrd_t *)malloc(num_threads * sizeof(thrd_t));
         for (size_t i = 0; i < num_threads; i++)
             thrd_create(&t[i], thread_func, NULL);
         thread_func(NULL);
         for (size_t i = 0; i < num_threads; i++)
             thrd_join(t[i], NULL);
+        free(t);
     }
     else
         thread_func(NULL);
 
+    free(queue.head);
     return 0;
 }
