@@ -27,21 +27,15 @@ typedef struct
     cnd_t notify;
     mtx_t q_lock;
     mtx_t r_lock;
+    HANDLE findh;
+    uint_fast64_t *chunks;
     char *head;
     size_t capacity;
     size_t index;
     size_t count;
+    size_t len_chunks;
     uint_fast8_t done;
-} Queue;
-
-const size_t name_len = sizeof(((struct _WIN32_FIND_DATAA *)0)->cFileName);
-const size_t c_size = sizeof(uint_fast64_t);
-
-uint_fast64_t *chunks = NULL;
-size_t len_chunks = 0;
-
-Queue queue;
-HANDLE findh;
+} Globals;
 
 // Compare 2 ull, used by qsort
 int ullcomp(const void *a, const void *b)
@@ -68,7 +62,11 @@ void exit_error(const char *prompt)
 }
 
 // Find the last chunk that should be kept for the region file
-uint_fast64_t *bsearch_c2(const uint_fast64_t target, size_t i0, size_t i1)
+const uint_fast64_t *bsearch_c2(
+    const uint_fast64_t *const chunks,
+    const uint_fast64_t target,
+    size_t i0,
+    size_t i1)
 {
     while (i1 - i0 > 1)
     {
@@ -82,10 +80,13 @@ uint_fast64_t *bsearch_c2(const uint_fast64_t target, size_t i0, size_t i1)
 }
 
 // Find the first chunk and call above function that should be kept for the region file
-uint_fast64_t *bsearch_c(const uint_fast64_t target, const size_t **const top)
+const uint_fast64_t *bsearch_c(
+    const uint_fast64_t *const chunks,
+    const uint_fast64_t target,
+    size_t i0,
+    size_t i1,
+    const size_t **const top)
 {
-    size_t i0 = 0;
-    size_t i1 = len_chunks;
     while (1)
     {
         const size_t j = (i0 + i1) >> 1;
@@ -99,7 +100,7 @@ uint_fast64_t *bsearch_c(const uint_fast64_t target, const size_t **const top)
         else
         {
             if (x == target && !*top)
-                *top = bsearch_c2(target, j, i1);
+                *top = bsearch_c2(chunks, target, j, i1);
             if (j == i1)
                 break;
             i1 = j;
@@ -111,56 +112,88 @@ uint_fast64_t *bsearch_c(const uint_fast64_t target, const size_t **const top)
 // Function for each thread. The threads self organize into roles they are needed
 int thread_func(void *arg)
 {
-    (void)arg;
-    const size_t capacity = queue.capacity;
+    Globals *const globals = (Globals *)arg;
+    uint8_t *buffer = NULL;
+    size_t buffer_size = 0;
+    uint_fast8_t done = 0;
     while (1)
     {
-        // The reader role. Looks through dictionary to find file names and populate queue
-        if ((queue.count < capacity) && !queue.done && (mtx_trylock(&(queue.r_lock)) == thrd_success))
+        mtx_lock(&globals->q_lock);
+        while (1)
         {
-            uint_fast8_t working;
-            do
+            if (globals->count << 1 < globals->capacity)
             {
-                WIN32_FIND_DATAA fileData;
-                if (!FindNextFileA(findh, &fileData))
+                if (!done)
                 {
-                    queue.done = 1;
-                    cnd_broadcast(&(queue.notify));
-                    break;
+                    if (mtx_trylock(&globals->r_lock) == thrd_success)
+                    {
+                        if (globals->done)
+                        {
+                            mtx_unlock(&globals->r_lock);
+                            done = 1;
+                        }
+                        else
+                        {
+                            // The reader role. Looks through dictionary to find file names and populate queue
+                            mtx_unlock(&(globals->q_lock));
+                            uint_fast8_t working;
+                            while (1) {
+                                WIN32_FIND_DATAA fileData;
+                                if (!FindNextFileA(globals->findh, &fileData))
+                                {
+                                    globals->done = 1;
+                                    mtx_unlock(&(globals->r_lock));
+                                    mtx_lock(&globals->q_lock);
+                                    cnd_broadcast(&globals->notify);
+                                    done = 1;
+                                    break;
+                                }
+                                mtx_lock(&globals->q_lock);
+                                size_t index = (globals->index + globals->count) % globals->capacity;
+                                strncpy(globals->head + (index << 6), fileData.cFileName, 64);
+                                working = (++globals->count < globals->capacity);
+                                cnd_signal(&globals->notify);
+                                if (!working) {
+                                    mtx_unlock(&(globals->r_lock));
+                                    break;
+                                }
+                                mtx_unlock(&globals->q_lock);
+                            }
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        if (globals->count)
+                            break;
+                        else
+                        {
+                            cnd_wait(&globals->notify, &globals->q_lock);
+                            continue;
+                        }
+                    }
                 }
-                mtx_lock(&(queue.q_lock));
-                size_t index = (queue.index + queue.count) % capacity;
-                memcpy(queue.head + (index * name_len), fileData.cFileName, name_len);
-                working = (++queue.count < capacity);
-                cnd_signal(&(queue.notify));
-                mtx_unlock(&(queue.q_lock));
-            } while (working);
-            mtx_unlock(&(queue.r_lock));
+                if (globals->count)
+                    break;
+                else
+                {
+                    mtx_unlock(&(globals->q_lock));
+                    free(buffer);
+                    return 0;
+                }
+            }
+            else
+                break;
         }
 
         // Process file role. Take names from queue and process the file
-        mtx_lock(&(queue.q_lock));
+        char name[65];
+        strncpy(name, globals->head + (globals->index << 6), 64);
+        globals->index = (globals->index + 1) % globals->capacity;
+        globals->count--;
+        mtx_unlock(&globals->q_lock);
 
-        while (1)
-        {
-            if (queue.count)
-                break;
-            if (queue.done)
-            {
-                mtx_unlock(&(queue.q_lock));
-                return 0;
-            }
-            cnd_wait(&(queue.notify), &(queue.q_lock));
-        }
-
-        char *name = malloc(name_len);
-        if (!name)
-            handle_error("Error while opening region files");
-        memcpy(name, queue.head + (queue.index * name_len), name_len);
-        queue.index = (queue.index + 1) % capacity;
-        queue.count--;
-        mtx_unlock(&(queue.q_lock));
-
+        name[64] = 0;
         char *ni = name;
         if (*ni++ != 'r' || *ni++ != '.')
             continue;
@@ -180,7 +213,7 @@ int thread_func(void *arg)
 
         uint_fast64_t rx = n - '0';
 
-        const char *ne = name + name_len;
+        const char *ne = name + 64;
         while (ni < ne)
         {
             n = *ni++;
@@ -215,14 +248,14 @@ int thread_func(void *arg)
             rz = rz * 10 + n - '0';
         }
 
-        if (ni + 2 >= ne || n != '.' || *ni++ != 'm' || *ni++ != 'c' || *ni != 'a')
+        if (ni + 3 >= ne || n != '.' || *ni++ != 'm' || *ni++ != 'c' || *ni++ != 'a' || *ni)
             continue;
         if (neg)
             rz *= -1;
 
-        const uint_fast64_t chunk = (rx << 37) | ((rz & 0x7FFFFFF) << 10);
+        const uint_fast64_t chunk = rx << 37 | (rz & 0x7FFFFFF) << 10;
         const uint_fast64_t *end = NULL;
-        uint_fast64_t *start = bsearch_c(chunk, &end);
+        const uint_fast64_t *const start = bsearch_c(globals->chunks, chunk, 0, globals->len_chunks, &end);
 
         if (!end)
         {
@@ -231,7 +264,7 @@ int thread_func(void *arg)
         }
 
         const uint_fast16_t elements = end - start;
-        uint_fast64_t *const c_keep = (uint_fast64_t *)malloc(elements * c_size);
+        uint_fast64_t *const c_keep = (uint_fast64_t *)malloc(elements * sizeof(uint_fast64_t));
         if (!c_keep)
             handle_error("Error while processing region files");
 
@@ -256,32 +289,30 @@ int thread_func(void *arg)
 
         size_t p = 0;
         uint_fast64_t *c_keep_ptr = c_keep;
-        uint_fast64_t *c_ptr = start;
+        const uint_fast64_t *c_ptr = start;
         for (uint_fast16_t i = 0; i < elements; i++)
         {
-            const size_t j = (*(c_ptr++) & 1023) << 2;
+            const size_t j = (*c_ptr++ & 1023) << 2;
             memset(header + p, 0, j - p);
 
             // 24 8 12 - offset, size, index
-            *(c_keep_ptr++) = ((uint_fast64_t)header[j] << 36) |
-                              ((uint_fast64_t)header[j | 1] << 28) |
-                              ((uint_fast64_t)header[j | 2] << 20) |
-                              ((uint_fast64_t)header[j | 3] << 12) |
-                              (j & 0xFFF);
+            *c_keep_ptr++ = (uint_fast64_t)header[j] << 36 |
+                            (uint_fast64_t)header[j | 1] << 28 |
+                            (uint_fast64_t)header[j | 2] << 20 |
+                            (uint_fast64_t)header[j | 3] << 12 |
+                            (j & 0xFFF);
             p = j + 4;
         }
         memset(header + p, 0, 4096 - p);
-        qsort(c_keep, elements, c_size, ullcomp);
+        qsort(c_keep, elements, sizeof(uint_fast64_t), ullcomp);
 
-        size_t buffer_size = 0x1000;
-        uint8_t *buffer = malloc(0x1000);
         c_keep_ptr = c_keep;
         fseek(file, 4096, SEEK_CUR);
         for (uint_fast16_t i = 0; i < elements; i++)
         {
             const long f_pos = ftell(file);
             const long diff = ((*c_keep_ptr & 0xFFFFFF00000) >> 8) - f_pos;
-            const size_t len = (*c_keep_ptr & 0xFF000);
+            const size_t len = *c_keep_ptr & 0xFF000;
             const size_t h_index = *c_keep_ptr & 0xFFF;
             c_keep_ptr++;
             if (!len)
@@ -291,15 +322,14 @@ int thread_func(void *arg)
                 fseek(file, len, SEEK_CUR);
                 continue;
             }
-
             if (len > buffer_size)
             {
-                buffer_size = len;
-                buffer = realloc(buffer, len);
+
+                buffer = (uint8_t *)realloc(buffer, len);
                 if (!buffer)
                     handle_error("Error compacting region files");
+                buffer_size = len;
             }
-
             header[h_index] = f_pos >> 28;
             header[h_index | 1] = f_pos >> 20;
             header[h_index | 2] = f_pos >> 12;
@@ -312,6 +342,7 @@ int thread_func(void *arg)
         long file_end = ftell(file);
         fseek(file, 0, SEEK_SET);
         fwrite(header, 1, 4096, file);
+        free(c_keep);
         fclose(file);
 
         HANDLE handle = CreateFileA(name, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -320,25 +351,22 @@ int thread_func(void *arg)
         SetFilePointer(handle, file_end, NULL, FILE_BEGIN);
         SetEndOfFile(handle);
         CloseHandle(handle);
-
-        free(buffer);
-        free(c_keep);
-        free(name);
     }
+    free(buffer);
     return 0;
 }
 
 // Initialize the queue
-void init_queue(size_t capacity)
+void init_queue(Globals *const globals, const size_t capacity)
 {
-    cnd_init(&(queue.notify));
-    mtx_init(&(queue.q_lock), mtx_plain);
-    mtx_init(&(queue.r_lock), mtx_plain);
-    queue.head = (char *)malloc(capacity * name_len);
-    queue.capacity = capacity;
-    queue.index = 0;
-    queue.count = 0;
-    queue.done = 0;
+    cnd_init(&globals->notify);
+    mtx_init(&globals->q_lock, mtx_plain);
+    mtx_init(&globals->r_lock, mtx_plain);
+    globals->head = (char *)malloc(capacity << 6);
+    globals->capacity = capacity;
+    globals->index = 0;
+    globals->count = 0;
+    globals->done = 0;
 }
 
 int main(int argc, char *argv[])
@@ -353,89 +381,96 @@ int main(int argc, char *argv[])
     if (argc > 2)
         file_name = argv[2];
 
+    Globals *const globals = (Globals *)malloc(sizeof(Globals));
+    if (globals == NULL)
+        handle_error("Error initializing variables");
+
+    FILE *file;
+    file = fopen(file_name, "rb");
+
+    if (file == NULL)
+        handle_error("Error opening input file");
+
+    fseek(file, 0, SEEK_END);
+    const size_t outlen = ftell(file);
+    rewind(file);
+
+    char *data = (char *)malloc(outlen + 1);
+    if (data == NULL)
+        handle_error("Error loading input file");
+
+    fread(data, 1, outlen, file);
+    fclose(file);
+
+    data[outlen] = 0;
+    globals->chunks = NULL;
+    globals->len_chunks = 0;
+    const char *index = data;
+    for (size_t i = 0;; i++)
     {
-        FILE *file;
-        file = fopen(file_name, "rb");
+        char *next;
 
-        if (file == NULL)
-            handle_error("Error opening input file");
-
-        fseek(file, 0, SEEK_END);
-        const size_t outlen = ftell(file);
-        rewind(file);
-
-        char *data = (char *)malloc(outlen + 1);
-        if (data == NULL)
-            handle_error("Error loading input file");
-
-        fread(data, 1, outlen, file);
-        fclose(file);
-        data[outlen] = 0;
-
-        const char *index = data;
-        for (size_t i = 0;; i++)
+        const uint_fast64_t num1 = strtoull(index, &next, 0);
+        if (next == index)
         {
-            char *next;
-
-            const uint_fast64_t num1 = strtoull(index, &next, 0);
-            if (next == index)
-            {
-                if (i == 0)
-                    exit_error("Error: Bad input file");
-                chunks = (uint_fast64_t *)realloc(chunks, i * c_size);
-                if (chunks == NULL)
-                    handle_error("Error parsing input file");
-                len_chunks = i;
-                qsort(chunks, len_chunks, c_size, ullcomp);
-                break;
-            }
-            index = next;
-
-            const uint_fast64_t num2 = strtoull(index, &next, 0);
-            if (next == index)
+            if (i == 0)
                 exit_error("Error: Bad input file");
-            index = next;
-
-            if (i >= len_chunks)
-            {
-                len_chunks = (len_chunks << 1) | 1;
-                chunks = (uint_fast64_t *)realloc(chunks, len_chunks * c_size);
-                if (chunks == NULL)
-                    handle_error("Error parsing input file");
-            }
-
-            // 27 27 5 5 - region x, z coordinate; chunk z, x region coordinate
-            chunks[i] = ((num1 & 0xFFFFFFE0) << 32) |
-                        ((num2 & 0xFFFFFFE0) << 5) |
-                        ((num2 & 31) << 5) |
-                        (num1 & 31);
+            globals->chunks = (uint_fast64_t *)realloc(globals->chunks, i * sizeof(uint_fast64_t));
+            if (globals->chunks == NULL)
+                handle_error("Error parsing input file");
+            globals->len_chunks = i;
+            qsort(globals->chunks, globals->len_chunks, sizeof(uint_fast64_t), ullcomp);
+            break;
         }
-        free(data);
-    }
+        index = next;
 
-    init_queue(num_threads);
+        const uint_fast64_t num2 = strtoull(index, &next, 0);
+        if (next == index)
+            exit_error("Error: Bad input file");
+        index = next;
+
+        if (i >= globals->len_chunks)
+        {
+            globals->len_chunks = globals->len_chunks << 1 | 1;
+            globals->chunks = (uint_fast64_t *)realloc(globals->chunks, globals->len_chunks * sizeof(uint_fast64_t));
+            if (globals->chunks == NULL)
+                handle_error("Error parsing input file");
+        }
+
+        // 27 27 5 5 - region x, z coordinate; chunk z, x region coordinate
+        globals->chunks[i] = (num1 & 0xFFFFFFE0) << 32 |
+                             (num2 & 0xFFFFFFE0) << 5 |
+                             (num2 & 31) << 5 |
+                             (num1 & 31);
+    }
+    free(data);
+
+    init_queue(globals, num_threads << 4);
+
     {
         WIN32_FIND_DATAA fileData;
-        findh = FindFirstFileA("*", &fileData);
-        if (findh == INVALID_HANDLE_VALUE)
+        globals->findh = FindFirstFileA("*", &fileData);
+        if (globals->findh == INVALID_HANDLE_VALUE)
             handle_error("Error opening folder");
-        size_t index = (queue.index + queue.count) % queue.capacity;
-        memcpy(queue.head + (index * name_len), fileData.cFileName, name_len);
+        size_t index = (globals->index + globals->count) % globals->capacity;
+        strncpy(globals->head + (index << 6), fileData.cFileName, 64);
     }
 
     if (--num_threads)
     {
-        thrd_t *t = malloc(sizeof(thrd_t) * num_threads);
-        if (!t)
-            handle_error("Error while creating threads");
+        thrd_t *t = (thrd_t *)malloc(num_threads * sizeof(thrd_t));
         for (size_t i = 0; i < num_threads; i++)
-            thrd_create(&t[i], thread_func, NULL);
-        thread_func(NULL);
+            thrd_create(&t[i], thread_func, globals);
+        thread_func(globals);
         for (size_t i = 0; i < num_threads; i++)
             thrd_join(t[i], NULL);
+        free(t);
     }
     else
-        thread_func(NULL);
+        thread_func(globals);
 
+    free(globals->head);
+    free(globals->chunks);
+    free(globals);
     return 0;
 }
