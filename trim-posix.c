@@ -138,14 +138,16 @@ int thread_func(void *arg)
                             // The reader role. Looks through dictionary to find file names and populate queue
                             mtx_unlock(&(globals->q_lock));
                             uint_fast8_t working;
-                            do
-                            {
+                            while (1) {
                                 struct dirent *f = readdir(globals->folder);
                                 if (!f)
                                 {
                                     closedir(globals->folder);
                                     globals->done = 1;
+                                    mtx_unlock(&(globals->r_lock));
+                                    mtx_lock(&globals->q_lock);
                                     cnd_broadcast(&globals->notify);
+                                    done = 1;
                                     break;
                                 }
                                 mtx_lock(&globals->q_lock);
@@ -153,10 +155,12 @@ int thread_func(void *arg)
                                 strncpy(globals->head + (index << 6), f->d_name, 64);
                                 working = (++globals->count < globals->capacity);
                                 cnd_signal(&globals->notify);
+                                if (!working) {
+                                    mtx_unlock(&(globals->r_lock));
+                                    break;
+                                }
                                 mtx_unlock(&globals->q_lock);
-                            } while (working);
-                            mtx_unlock(&(globals->r_lock));
-                            mtx_lock(&(globals->q_lock));
+                            }
                             continue;
                         }
                     }
@@ -176,8 +180,7 @@ int thread_func(void *arg)
                 else
                 {
                     mtx_unlock(&(globals->q_lock));
-                    if (buffer_size)
-                        free(buffer);
+                    free(buffer);
                     return 0;
                 }
             }
@@ -345,8 +348,7 @@ int thread_func(void *arg)
         free(c_keep);
         fclose(file);
     }
-    if (buffer_size)
-        free(buffer);
+    free(buffer);
     return 0;
 }
 
